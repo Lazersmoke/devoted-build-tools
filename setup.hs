@@ -3,11 +3,13 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
-import System.IO
+import Data.List (isInfixOf)
+import System.IO.Unsafe (unsafePerformIO)
 import System.Environment
 import System.Process
 import Control.Monad
 import System.Directory
+import System.FilePath
 import Prelude hiding (FilePath)
 
 supportedMCVersions :: [String]
@@ -17,109 +19,125 @@ supportedMCVersions =
   ,"1.8.7"
   ]
 
+devotedDir :: FilePath
+devotedDir = unsafePerformIO $ makeAbsolute "devoted"
+
+spigotDir :: FilePath
+spigotDir = unsafePerformIO $ makeAbsolute "devoted-spigot"
+
+spigotBuild :: FilePath
+spigotBuild = unsafePerformIO $ makeAbsolute "spigot-build"
+
+-- print is a horrible hack to prevent spigotBuild and spigotDir from being forced while current directory is devotedDir
 main :: IO ()
-main = doesDirectoryExist "devoted" >>= \serverSetup -> getArgs >>= \case
+main = print [devotedDir,spigotDir,spigotBuild] >> getArgs >>= \case
   -- If they didn't give any arguments, tell them to
-  [] -> putStrLn "Please specify a Minecraft version to build with. Try one of: " >> mapM_ print supportedMCVersions
-  -- If they say to cleanup, cleanup
+  [] -> putStrLn "Please specify a command. Try: `./setup.hs clean` or `./setup.hs install 1.10.2`"
   ("clean":_) -> cleanup
-  -- If they say to stop, stop
-  ("stop":_) -> if not serverSetup
-    then putStrLn "You need to setup the server with `./setup.hs version <Minecraft Version>` before stopping it"
-    else setCurrentDirectory "devoted" >> stopServer >> return ()
-  -- If they say to start, start
-  ("start":_) -> if not serverSetup
-    then putStrLn "You need to setup the server with `./setup.hs version <Minecraft Version>` before starting it"
-    else setCurrentDirectory "devoted" >> startServer >> return ()
-  -- If the are giving us a minecraft version, check it
-  ("version":mcVer:_) -> if not $ mcVer `elem` supportedMCVersions
-    -- If they gave us an unsupported (or non-sense) version, tell them so
-    then putStrLn $ "Unsupported Minecraft version: " ++ show mcVer
+  ("stop":_) -> stopServer
+  ("attach":_) -> attachServer
+  ("start":_) -> startServer
+  ("install":mcVer:_) ->
+    -- If the are giving us a minecraft version, check it, warning them if it is unsupported
+    ensure (return $ mcVer `elem` supportedMCVersions) unsupportedVer $
     -- Make sure they didn't already run the script and create the files
-    else if serverSetup
+    ensure (not <$> doesDirectoryExist devotedDir) alreadyExists $ do
+      -- If all is well, proceed with the setup
+      -- Download Mojangcraft and set it up
+      installVanilla mcVer
+      -- Replace Mojangcraft with Spigot
+      buildSpigot mcVer
+      putStrLn "Done!"
+    where
+    -- If they gave us an unsupported (or non-sense) version, tell them so
+      unsupportedVer = "Unsupported Minecraft version: \"" ++ show mcVer ++ "\". Try one of: \n" ++ unlines supportedMCVersions
       -- If they already set it up, warn and exit
-      then putStrLn "Warning: `devoted` folder already exists. Please run `./setup.hs clean` or remove it manually before reinstalling"
-      -- Otherwise, proceed with the installation
-      else do
-        -- Download Mojangcraft and set it up
-        installVanilla mcVer
-        -- Replace Mojangcraft with Spigot
-        buildSpigot mcVer
-        putStrLn "Done!"
+      alreadyExists = "Warning: `devoted` folder already exists. Please run `./setup.hs clean` or remove it manually before reinstalling"
   -- If the argument is non-sense, warn and exit
-  _ -> putStrLn "Invalid arguments. Try `./setup.hs clean` or `./setup.hs version <Minecraft Version>`"
+  _ -> putStrLn "Invalid arguments. Try `./setup.hs clean` or `./setup.hs install <Minecraft Version>`"
 
 cleanup :: IO ()
 cleanup = do
-  -- Delete both folders, making sure the exist first
-  forM_ ["devoted","devoted-spigot","spigot-build"] $ \x -> doesDirectoryExist x >>= flip when (removeDirectoryRecursive x)
-  putStrLn $ "All clean!"
+  -- Delete all directories, making sure they exist so that we don't get errors
+  forM_ [devotedDir,spigotDir,spigotBuild] $ \x -> doesDirectoryExist x >>= flip when (removeDirectoryRecursive x)
+  putStrLn "All clean!"
 
 installVanilla :: String -> IO ()
 installVanilla mcVer = do
   -- Create the directory we will install into
-  createDirectoryIfMissing True "devoted"
-  -- Move into the new install directory
-  setCurrentDirectory "devoted"
+  createDirectoryIfMissing True devotedDir
   -- Grab Mojangcraft jar from the offical download link
   -- Injection here is impossible because `elem mcVer supportedMCVersions`
-  callProcess "wget" ["https://s3.amazonaws.com/Minecraft.Download/versions/" ++ mcVer ++ "/minecraft_server." ++ mcVer ++ ".jar","-O","minecraft_server.jar"]
+  callProcess "wget" ["https://s3.amazonaws.com/Minecraft.Download/versions/" ++ mcVer ++ "/minecraft_server." ++ mcVer ++ ".jar","-O",devotedDir </> "minecraft_server.jar"]
   -- Premptively agree to the EULA. Please no murder me M$ :3
-  writeFile "eula.txt" "eula=true"
+  writeFile (devotedDir </> "eula.txt") "eula=true"
   -- Let the server initialize. The important thing is that it accepts our eula agreement
   startServer
   stopServer
-  -- Back out to main directory for spigot build
-  setCurrentDirectory ".."
 
 buildSpigot :: String -> IO ()
 buildSpigot mcVer = do
   -- Create and enter the build directory
-  createDirectoryIfMissing True "spigot-build"
-  setCurrentDirectory "spigot-build"
+  createDirectoryIfMissing True spigotBuild
   -- Get the spigot build tools ready
-  callProcess "wget" ["https://hub.spigotmc.org/jenkins/job/BuildTools/lastSuccessfulBuild/artifact/target/BuildTools.jar","-O","BuildTools.jar"]
+  callCommand $ "wget https://hub.spigotmc.org/jenkins/job/BuildTools/lastSuccessfulBuild/artifact/target/BuildTools.jar -O " ++ spigotBuild </> "BuildTools.jar"
   -- Spigot build tools like to have this unset for whatever reason; discard the exit code cause it can be 5 for some reason /shrug
-  _ <- waitForProcess =<< spawnCommand ("git config --global --unset core.autocrlf")
+  _ <- waitForProcess =<< spawnCommand "git config --global --unset core.autocrlf"
+  -- Go into the build directory so BuildTools.jar puts its files in the right place
+  setCurrentDirectory spigotBuild
   -- Actually build Spigot
   putStrLn "Building spigot, might take a while"
   callProcess "java" ["-Xmx1500M","-jar","BuildTools.jar","--rev",mcVer]
-  -- We are done building, so back out of the directory
-  setCurrentDirectory ".."
   -- Make sure that it compiled properly and actually generated an artifact
   let spigotJar = "spigot-" ++ mcVer ++ ".jar"
   let cbJar = "craftbukkit-" ++ mcVer ++ ".jar"
-  let spigotBuild = "spigot-build/"
-  compilationWorked <- doesFileExist (spigotBuild ++ spigotJar)
-  if not compilationWorked
-    then putStrLn "Failed to compile Spigot"
-    else do
-      -- Create the spigot artifact storage folder
-      createDirectoryIfMissing True "devoted-spigot"
-      -- Install the Spigot jar into the minecraft server
-      copyFile (spigotBuild ++ spigotJar) "devoted/minecraft_server.jar"
-      -- Archive the Spigot and Craftbukkit jars
-      copyFile (spigotBuild ++ spigotJar) ("devoted-spigot/" ++ spigotJar)
-      copyFile (spigotBuild ++ cbJar) ("devoted-spigot/" ++ cbJar)
-      -- Install Spigot and CB pom files
-      copyFile (spigotBuild ++ "Spigot/Spigot-Server/pom.xml") "devoted-spigot/spigot-pom.xml"
-      copyFile (spigotBuild ++ "CraftBukkit/pom.xml") "devoted-spigot/craftbukkit-pom.xml"
-      -- Install Spigot jars into Maven
-      callProcess "mvn" ["install:install-file","-Dfile=" ++ spigotBuild ++ spigotJar,"-Dpackaging=jar","-DpomFile=" ++ spigotBuild ++ "Spigot/Spigot-Server/pom.xml"]
-      callProcess "mvn" ["install:install-file","-Dfile=" ++ spigotBuild ++ cbJar,"-Dpackaging=jar","-DpomFile=" ++ spigotBuild ++ "CraftBukkit/pom.xml"]
+  -- Ensure the build worked
+  ensure (doesFileExist (spigotBuild </> spigotJar)) "Failed to compile Spigot" $ do
+    -- Create the spigot artifact storage folder
+    createDirectoryIfMissing True spigotDir
+    -- Install the Spigot jar into the minecraft server
+    copyFile (spigotBuild </> spigotJar) (devotedDir </> "minecraft_server.jar")
+    -- Archive the Spigot and Craftbukkit jars
+    copyFile (spigotBuild </> spigotJar) (spigotDir </> spigotJar)
+    copyFile (spigotBuild </> cbJar) (spigotDir </> cbJar)
+    -- Install Spigot and CB pom files
+    copyFile (spigotBuild </> "Spigot/Spigot-Server/pom.xml") (spigotDir </> "spigot-pom.xml")
+    copyFile (spigotBuild </> "CraftBukkit/pom.xml") (spigotDir </> "craftbukkit-pom.xml")
+    -- Install Spigot jars into Maven
+    callProcess "mvn" ["install:install-file","-Dfile=" ++ spigotBuild </> spigotJar,"-Dpackaging=jar","-DpomFile=" ++ spigotBuild </> "Spigot/Spigot-Server/pom.xml"]
+    callProcess "mvn" ["install:install-file","-Dfile=" ++ spigotBuild </> cbJar,"-Dpackaging=jar","-DpomFile=" ++ spigotBuild </> "CraftBukkit/pom.xml"]
 
--- Start the server (must be inside "devoted" upon call)
+-- Server directory must exist in order to start the server
 startServer :: IO ()
-startServer = do
+startServer = ensureServerExists $ do
+  -- Go into server directory so screen can find `minecraft_server.jar`
+  setCurrentDirectory devotedDir
   putStrLn "Starting Server..."
-  -- 'screen -d -R' will attach to an existing session if possible, or start the server if it isn't already
-  callCommand $ devotedScreen ++ "-d -R bash -c 'java -Xmx1500M -Xms500M -XX:MaxPermSize=256M -jar minecraft_server.jar nogui'"
+  -- `-dmS` is dameon mode; screen will run in the background. To control it manually, see `attachServer`
+  callCommand $ "screen -dmS mc_screen -p 0 bash -c 'java -Xmx1500M -Xms500M -XX:MaxPermSize=256M -jar minecraft_server.jar nogui'"
 
--- Stop the server (must be inside "devoted" upon call)
+-- The server must be up in order to attach to it
+attachServer :: IO ()
+attachServer = ensureServerUp $ do
+  putStrLn "Attaching to Server..."
+  -- `-r` will attach the console to the server screen
+  callCommand $ "screen -S mc_screen -p 0 -r"
+
+-- Stop the server (the server must be up to do this)
 stopServer :: IO ()
-stopServer = do
+stopServer = ensureServerUp $ do
   putStrLn "Stopping Server..."
-  callCommand $ devotedScreen ++ "-X stuff 'stop\n'"
+  -- `-X stuff 'stop\n'` will push the text "stop" and newline into screen, issuing the /stop command to the server
+  callCommand $ "screen -S mc_screen -p 0 -X stuff 'stop\n'"
 
-devotedScreen :: String
-devotedScreen = "screen -S mc_screen -p 0 "
+-- The server being up ~= screen lists "mc_screen" as one of the present screens
+ensureServerUp :: IO () -> IO ()
+ensureServerUp = ensureServerExists . ensure (isInfixOf "mc_screen" . (\(_,a,_) -> a) <$> readProcessWithExitCode "screen" ["-list"] "") "Server is not running!"
+
+-- The server existing ~= the server directory exists
+ensureServerExists :: IO () -> IO ()
+ensureServerExists = ensure (doesDirectoryExist devotedDir) $ "\"" ++ devotedDir ++ "\" does not exist! Try running `./setup.hs install <Minecraft Version>` to setup the server."
+
+-- Ensure some invariant, on threat of printing an error message and not calling the continuation
+ensure :: IO Bool -> String -> IO () -> IO ()
+ensure p f x = p >>= \b -> if b then x else putStrLn f
